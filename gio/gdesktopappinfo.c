@@ -2805,11 +2805,17 @@ create_systemd_scope (GDBusConnection    *session_bus,
                           user_data);
 }
 
+typedef struct {
+  GTask *task;
+  int fd;
+} ScopeCreatedData;
+
 static void
 systemd_scope_created_cb (GObject      *object,
                           GAsyncResult *result,
                           gpointer      user_data)
 {
+  ScopeCreatedData *data = user_data;
   g_autoptr(GError) error = NULL;
 
   g_dbus_connection_call_finish (G_DBUS_CONNECTION (object), result, &error);
@@ -2817,9 +2823,47 @@ systemd_scope_created_cb (GObject      *object,
       g_debug ("Failed to move new child into scope: %s", error->message);
 
   /* Unblock the waiting wrapper binary. */
-  close (GPOINTER_TO_INT (user_data));
+  close (data->fd);
+
+  if (data->task)
+    {
+      gint pending;
+      pending = GPOINTER_TO_INT (g_object_get_data ((GObject*) data->task,
+                                                    "pending-calls"));
+      pending -= 1;
+      g_object_set_data ((GObject*) data->task,
+                         "pending-calls",
+                         GINT_TO_POINTER (pending));
+
+      if (pending == 0 && !g_task_get_completed (data->task))
+        g_task_return_boolean (data->task, TRUE);
+    }
+
+  g_clear_object (&data->task);
+  g_free (data);
 }
 #endif
+
+static void
+launch_uris_with_spawn_flush_cb (GObject      *object,
+                                 GAsyncResult *result,
+                                 gpointer      user_data)
+{
+  g_autoptr(GTask) task = G_TASK (user_data);
+  gint pending;
+
+  g_dbus_connection_flush_finish (G_DBUS_CONNECTION (object), result, NULL);
+
+  pending = GPOINTER_TO_INT (g_object_get_data ((GObject*) task,
+                                                "pending-calls"));
+  pending -= 1;
+  g_object_set_data ((GObject*) task,
+                     "pending-calls",
+                     GINT_TO_POINTER (pending));
+
+  if (pending == 0 && !g_task_get_completed (task))
+    g_task_return_boolean (task, TRUE);
+}
 
 static gboolean
 g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
@@ -2835,15 +2879,22 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
                                            gint                        stdin_fd,
                                            gint                        stdout_fd,
                                            gint                        stderr_fd,
-                                           GError                    **error)
+                                           GTask                      *task,
+                                           GError                    **error_out)
 {
+  GError *error = NULL;
   GList *old_uris;
   GList *dup_uris;
 
   g_auto(GStrv) argv = NULL, envp = NULL;
   int argc;
 
+  /* We may get a task to report back on or an error. But never both. */
+  g_assert (!(task && error_out));
   g_return_val_if_fail (info != NULL, FALSE);
+
+  if (session_bus && task)
+    g_object_set_data ((GObject*) task, "pending-calls", GINT_TO_POINTER (0));
 
   if (launch_context)
     envp = g_app_launch_context_get_environment (launch_context);
@@ -2870,8 +2921,8 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
       gpointer             setup_data = user_setup_data;
 
       old_uris = dup_uris;
-      if (!expand_application_parameters (info, exec_line, &dup_uris, &argc, &argv, error))
-        return FALSE;
+      if (!expand_application_parameters (info, exec_line, &dup_uris, &argc, &argv, &error))
+        goto err;
 
       /* Get the subset of URIs we're launching with this process */
       launched_uris = NULL;
@@ -2881,9 +2932,9 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
 
       if (info->terminal && !prepend_terminal_to_vector (&argc, &argv))
         {
-          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                               _("Unable to find terminal required for application"));
-          return FALSE;
+          error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_FAILED,
+                                       _("Unable to find terminal required for application"));
+          goto err;
         }
 
       if (info->filename)
@@ -2941,9 +2992,9 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
        * otherwise our wrapper script will close both sides. */
       if (!g_unix_open_pipe (wrapper_data.pipe, 0, NULL))
         {
-          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                               _("Unable to create pipe for systemd synchronization"));
-          return FALSE;
+          error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_FAILED,
+                                       _("Unable to create pipe for systemd synchronization"));
+          goto err;
         }
 
       /* Set CLOEXEC on the write pipe, so we don't need to deal with it in the child. */
@@ -2976,7 +3027,7 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
                                    stdin_fd,
                                    stdout_fd,
                                    stderr_fd,
-                                   error))
+                                   &error))
         {
 #if defined(__linux__) && !defined(__BIONIC__)
           close (wrapper_data.pipe[0]);
@@ -2989,7 +3040,7 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
           g_free (sn_id);
           g_list_free (launched_uris);
 
-          return FALSE;
+          goto err;
         }
 
 #if defined(__linux__) && !defined(__BIONIC__)
@@ -2998,11 +3049,32 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
       close (wrapper_data.pipe[0]);
 
       if (session_bus)
-        create_systemd_scope (session_bus,
-                              info,
-                              pid,
-                              systemd_scope_created_cb,
-                              GINT_TO_POINTER (wrapper_data.pipe[1]));
+        {
+          ScopeCreatedData *data;
+
+          data = g_new0 (ScopeCreatedData, 1);
+
+          if (task)
+            {
+              gint pending;
+              pending = GPOINTER_TO_INT (g_object_get_data ((GObject*) task,
+                                                            "pending-calls"));
+              pending += 1;
+              g_object_set_data ((GObject*) task,
+                                 "pending-calls",
+                                 GINT_TO_POINTER (pending));
+
+              data->task = g_object_ref (task);
+            }
+
+          data->fd = wrapper_data.pipe[1];
+
+          create_systemd_scope (session_bus,
+                                info,
+                                pid,
+                                systemd_scope_created_cb,
+                                data);
+        }
       else
         close (wrapper_data.pipe[1]);
 #endif
@@ -3033,7 +3105,53 @@ g_desktop_app_info_launch_uris_with_spawn (GDesktopAppInfo            *info,
     }
   while (dup_uris != NULL);
 
+  if (session_bus && task)
+    {
+      GCancellable *cancellable = g_task_get_cancellable (task);
+      gint pending;
+      pending = GPOINTER_TO_INT (g_object_get_data ((GObject*) task,
+                                                    "pending-calls"));
+      pending += 1;
+      g_object_set_data ((GObject*) task,
+                         "pending-calls",
+                         GINT_TO_POINTER (pending));
+
+      /* FIXME: The D-Bus message from the notify_desktop_launch() function
+       * can be still lost even if flush is called later. See:
+       * https://gitlab.freedesktop.org/dbus/dbus/issues/72
+       */
+      g_dbus_connection_flush (session_bus,
+                               cancellable,
+                               launch_uris_with_spawn_flush_cb,
+                               g_steal_pointer (&task));
+    }
+  else if (session_bus)
+    {
+      /* No task available. */
+      g_dbus_connection_flush (session_bus,
+                               NULL,
+                               NULL,
+                               NULL);
+    }
+  else if (task)
+    {
+      /* Return the given task. */
+      g_task_return_boolean (task, TRUE);
+      g_object_unref (task);
+    }
+
   return TRUE;
+
+err:
+  if (task)
+    {
+      g_task_return_error (task, error);
+      g_object_unref (task);
+    }
+  else
+    g_propagate_error (error_out, error);
+
+  return FALSE;
 }
 
 static gchar *
@@ -3166,7 +3284,7 @@ g_desktop_app_info_launch_uris_internal (GAppInfo                   *appinfo,
                                          GError                     **error)
 {
   GDesktopAppInfo *info = G_DESKTOP_APP_INFO (appinfo);
-  GDBusConnection *session_bus;
+  g_autoptr(GDBusConnection) session_bus = NULL;
   gboolean success = TRUE;
 
   session_bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, NULL);
@@ -3182,17 +3300,7 @@ g_desktop_app_info_launch_uris_internal (GAppInfo                   *appinfo,
     success = g_desktop_app_info_launch_uris_with_spawn (info, session_bus, info->exec, uris, launch_context,
                                                          spawn_flags, user_setup, user_setup_data,
                                                          pid_callback, pid_callback_data,
-                                                         stdin_fd, stdout_fd, stderr_fd, error);
-
-  if (session_bus != NULL)
-    {
-      /* This asynchronous flush holds a reference until it completes,
-       * which ensures that the following unref won't immediately kill
-       * the connection if we were the initial owner.
-       */
-      g_dbus_connection_flush (session_bus, NULL, NULL, NULL);
-      g_object_unref (session_bus);
-    }
+                                                         stdin_fd, stdout_fd, stderr_fd, NULL, error);
 
   return success;
 }
@@ -3247,18 +3355,6 @@ launch_uris_with_dbus_cb (GObject      *object,
 }
 
 static void
-launch_uris_flush_cb (GObject      *object,
-                      GAsyncResult *result,
-                      gpointer      user_data)
-{
-  GTask *task = G_TASK (user_data);
-
-  g_dbus_connection_flush_finish (G_DBUS_CONNECTION (object), result, NULL);
-  g_task_return_boolean (task, TRUE);
-  g_object_unref (task);
-}
-
-static void
 launch_uris_bus_get_cb (GObject      *object,
                         GAsyncResult *result,
                         gpointer      user_data)
@@ -3268,7 +3364,6 @@ launch_uris_bus_get_cb (GObject      *object,
   LaunchUrisData *data = g_task_get_task_data (task);
   GCancellable *cancellable = g_task_get_cancellable (task);
   GDBusConnection *session_bus;
-  GError *error = NULL;
 
   session_bus = g_bus_get_finish (result, NULL);
 
@@ -3286,25 +3381,11 @@ launch_uris_bus_get_cb (GObject      *object,
     }
   else
     {
-      /* FIXME: The D-Bus message from the notify_desktop_launch() function
-       * can be still lost even if flush is called later. See:
-       * https://gitlab.freedesktop.org/dbus/dbus/issues/72
-       */
       g_desktop_app_info_launch_uris_with_spawn (info, session_bus, info->exec,
                                                  data->uris, data->context,
                                                  _SPAWN_FLAGS_DEFAULT, NULL,
                                                  NULL, NULL, NULL, -1, -1, -1,
-                                                 &error);
-      if (error != NULL)
-        {
-          g_task_return_error (task, g_steal_pointer (&error));
-          g_object_unref (task);
-        }
-      else
-        g_dbus_connection_flush (session_bus,
-                                 cancellable,
-                                 launch_uris_flush_cb,
-                                 g_steal_pointer (&task));
+                                                 g_steal_pointer (&task), NULL);
     }
 
   g_clear_object (&session_bus);
@@ -5089,7 +5170,7 @@ g_desktop_app_info_launch_action (GDesktopAppInfo   *info,
                                   const gchar       *action_name,
                                   GAppLaunchContext *launch_context)
 {
-  GDBusConnection *session_bus;
+  g_autoptr(GDBusConnection) session_bus = NULL;
 
   g_return_if_fail (G_IS_DESKTOP_APP_INFO (info));
   g_return_if_fail (action_name != NULL);
@@ -5121,15 +5202,9 @@ g_desktop_app_info_launch_action (GDesktopAppInfo   *info,
       if (exec_line)
         g_desktop_app_info_launch_uris_with_spawn (info, session_bus, exec_line, NULL, launch_context,
                                                    _SPAWN_FLAGS_DEFAULT, NULL, NULL, NULL, NULL,
-                                                   -1, -1, -1, NULL);
+                                                   -1, -1, -1, NULL, NULL);
 
       g_free (exec_line);
-    }
-
-  if (session_bus != NULL)
-    {
-      g_dbus_connection_flush (session_bus, NULL, NULL, NULL);
-      g_object_unref (session_bus);
     }
 }
 /* Epilogue {{{1 */
